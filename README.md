@@ -82,3 +82,5 @@ BASE_DOMAIN: example.opentlc.com
 # ansible-playbook main.yaml 
 
 ```
+
+>**Note: the pull-secret info in roles/aro-instal/templates/install-config.j2 is modified. You need put you our own credentail before running this playbook**
