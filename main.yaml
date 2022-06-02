@@ -1,0 +1,13 @@
+---
+- hosts: localhost
+  connection: local
+  become: true
+  gather_facts: false
+
+
+  tasks:
+
+  - name: Azure ARM Installation
+    include_role:
+      name: aro-instal
+

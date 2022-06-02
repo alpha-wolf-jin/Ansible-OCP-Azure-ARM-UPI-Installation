@@ -1,0 +1,12 @@
+---
+# tasks file for aro-instal
+#
+
+- name: Template a file to /etc/file.conf
+  ansible.builtin.template:
+    src: osServicePrincipal.j2
+    dest: ~/.azure/osServicePrincipal.json
+    owner: root
+    group: root
+    mode: '0400'
+

@@ -1,0 +1,488 @@
+---
+# tasks file for aro-instal
+#
+
+- name: clean and create aro dir
+  ansible.builtin.shell: |
+    rm -rf {{ base_home }}
+    mkdir -p {{ base_home }}
+
+- name: Find out playbook's path
+  shell: pwd
+  register: playbook_path_output
+- debug: var=playbook_path_output.stdout
+
+- name: extract varaible value
+  ansible.builtin.shell: |
+    set -o pipefail
+    grep 'Subscription ID:' credential | awk '{print $3}'> {{ base_home }}/subscriptionId
+    grep 'Client ID:' credential | awk '{print $3}'> {{ base_home }}/clientId
+    grep 'Client Secret:' credential | awk '{print $3}'> {{ base_home }}/clientSecret
+    grep 'Tenant ID:' credential | awk '{print $3}'> {{ base_home }}/tenantId
+    grep 'export GUID=' credential | awk -F '=' '{print $2}' > {{ base_home }}/GUID
+    grep 'export RESOURCEGROUP=' credential | awk -F '=' '{print $2}' > {{ base_home }}/RESOURCEGROUP
+    grep 'export CLIENT_ID=' credential | awk -F '=' '{print $2}' > {{ base_home }}/CLIENT_ID
+    grep 'export PASSWORD=' credential | awk -F '=' '{print $2}' > {{ base_home }}/PASSWORD
+    grep 'export TENANT=' credential | awk -F '=' '{print $2}' > {{ base_home }}/TENANT
+
+- name: set varaible account_key
+  set_fact:
+    subscriptionId: "{{ lookup('file', base_home + '/subscriptionId') }}"
+    clientId: "{{ lookup('file', base_home + '/clientId') }}"
+    clientSecret: "{{ lookup('file', base_home + '/clientSecret') }}"
+    tenantId: "{{ lookup('file', base_home + '/tenantId') }}"
+    GUID: "{{ lookup('file', base_home + '/GUID') }}"
+    RESOURCEGROUP: "{{ lookup('file', base_home + '/RESOURCEGROUP') }}"
+    CLIENT_ID: "{{ lookup('file', base_home + '/CLIENT_ID') }}"
+    PASSWORD: "{{ lookup('file', base_home + '/PASSWORD') }}"
+    TENANT: "{{ lookup('file', base_home + '/TENANT') }}"
+    CLUSTER_NAME: 'aro'
+    AZURE_REGION: 'eastus'
+    BASE_DOMAIN: 'example.opentlc.com'
+
+- name: Create azure auth file osServicePrincipal.json
+  ansible.builtin.template:
+    src: osServicePrincipal.j2
+    dest: ~/.azure/osServicePrincipal.json
+    owner: root
+    group: root
+    mode: '0400'
+
+- name: 01 Create public DNS zone - login azue
+  ansible.builtin.shell: |
+    az login --service-principal -u {{ CLIENT_ID }} -p {{ PASSWORD }} --tenant {{ TENANT}}
+  register: result
+  until: result.rc == 0
+  retries: 6
+  delay: 10
+
+
+- name: 01 Create public DNS zone - create public DNS zone
+  ansible.builtin.shell: |
+    az network dns zone create -g {{ RESOURCEGROUP }} -n {{ BASE_DOMAIN }}
+  register: result
+  until: result.rc == 0
+  retries: 6
+  delay: 10
+
+- name: get the NS for the DNS zone
+  set_fact:
+    ns_name: "{{ result['stdout'] | from_json | community.general.json_query('nameServers[0]') }}"
+
+- name: Simple A record (IPV4 address) lookup for NS
+  set_fact:
+    ns_ip: "{{ lookup('community.general.dig', ns_name)}}"
+
+- name: Template a file for NIC and DNS conf
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop:
+  - { src: resolv.j2 , dest: /etc/resolv.conf }
+  - { src: ifcfg-enp1s0-1.j2 , dest: /etc/sysconfig/network-scripts/ifcfg-enp1s0-1 }
+
+
+- name: 02 Create Configuration file
+  ansible.builtin.template:
+    src: install-config.j2
+    dest: "{{ base_home + '/install-config.yaml' }}"
+    owner: root
+    group: root
+    mode: '0400'
+
+- name: 03 Create manifest files & 04 Create Ignite files
+  ansible.builtin.shell: |
+    openshift-install create manifests --dir {{ base_home }}
+    export INFRA_ID=`yq -r '.status.infrastructureName' {{ base_home }}/manifests/cluster-infrastructure-02-config.yml`
+    echo -n $INFRA_ID > ./INFRA_ID
+    sed -i "s/${INFRA_ID}-rg/{{ RESOURCEGROUP }}/g" {{ base_home }}/manifests/*
+    sed -i "s/${INFRA_ID}-rg/{{ RESOURCEGROUP }}/g" {{ base_home }}/openshift/*
+    rm -f {{ base_home }}/openshift/99_openshift-cluster-api_master-machines-*.yaml
+    rm -f {{ base_home }}/openshift/99_openshift-cluster-api_worker-machineset-*.yaml
+    openshift-install create ignition-configs --dir {{ base_home }}
+    export SSH_KEY=`cat ~/.ssh/id_ed25519.pub`
+  args:
+    chdir: "{{ base_home }}"
+
+
+
+- name: set varaible account_key
+  set_fact:
+    infra_id:    "{{ lookup('file', base_home + '/INFRA_ID') }}"
+
+
+- name: 05 Create an Azure identity for predefined the resource group - create {{ infra_id }}-identity
+  ansible.builtin.shell: |
+    echo az identity create -g {{ RESOURCEGROUP }} -n {{ infra_id }}-identity
+    az identity create -g {{ RESOURCEGROUP }} -n {{ infra_id }}-identity
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.rc == 0
+  retries: 6
+  delay: 10
+
+- name: 05 Create an Azure identity for predefined the resource group - role assignment for {{ infra_id }}-identity
+  ansible.builtin.shell: |
+    export PRINCIPAL_ID=`az identity show -g {{ RESOURCEGROUP }} -n {{ infra_id }}-identity --query principalId --out tsv`
+    export RESOURCE_GROUP_ID=`az group show -g {{ RESOURCEGROUP }} --query id --out tsv`
+    echo az role assignment create --assignee ${PRINCIPAL_ID} --role 'Contributor' --scope ${RESOURCE_GROUP_ID}
+    az role assignment create --assignee ${PRINCIPAL_ID} --role 'Contributor' --scope ${RESOURCE_GROUP_ID}
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.rc == 0
+  retries: 6
+  delay: 10
+
+
+- name: 06 Uploading the RHCOS cluster image and bootstrap Ignition config file - create storage account
+  ansible.builtin.shell: |
+    az storage account create -g {{ RESOURCEGROUP }} --location {{ AZURE_REGION }} --name {{ CLUSTER_NAME }}sa --kind Storage --sku Standard_LRS
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.rc == 0
+  retries: 6
+  delay: 10
+
+- name: 06 Uploading the RHCOS cluster image and bootstrap Ignition config file - Create the storage container for the VHD
+  ansible.builtin.shell: |
+    export ACCOUNT_KEY=`az storage account keys list -g {{ RESOURCEGROUP }}  --account-name {{ CLUSTER_NAME }}sa --query "[0].value" -o tsv`
+    echo -n $ACCOUNT_KEY > ./ACCOUNT_KEY
+    az storage container create --name vhd --account-name {{ CLUSTER_NAME }}sa --account-key ${ACCOUNT_KEY} 
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.rc == 0
+  retries: 6
+  delay: 10
+
+- name: set varaible account_key
+  set_fact:
+    account_key: "{{ lookup('file', base_home + '/ACCOUNT_KEY') }}"
+
+- name: 06 Uploading the RHCOS cluster image and bootstrap Ignition config file - Copy the local VHD to a blob
+  ansible.builtin.shell: |
+    export VHD_URL=$(openshift-install coreos print-stream-json | jq -r '.architectures.x86_64."rhel-coreos-extensions"."azure-disk".url')
+    az storage blob copy start --account-name {{ CLUSTER_NAME }}sa --account-key {{ account_key }} --destination-blob "rhcos.vhd" --destination-container vhd --source-uri ${VHD_URL}
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.rc == 0
+  retries: 6
+  delay: 10
+
+
+- name: 06 Copy the local VHD to a blob, Track copy progressgin.. 
+  ansible.builtin.shell: |
+    az storage blob show --container-name vhd --name "rhcos.vhd" --account-name {{ CLUSTER_NAME }}sa --account-key {{ account_key }} -o tsv --query properties.copy.status
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.stdout_lines[-1] == 'success'
+  retries: 120
+  delay: 10
+          
+
+- name: 06 Create a blob storage container and upload the generated bootstrap.ign file - Create a blob storage container
+  ansible.builtin.shell: |
+    az storage container create --name files --account-name {{ CLUSTER_NAME }}sa --account-key {{ account_key }} 
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.rc == 0
+  retries: 6
+  delay: 10
+
+- name: 06 Create a blob storage container and upload the generated bootstrap.ign file - upload the generated bootstrap.ign file
+  ansible.builtin.shell: |
+    az storage blob upload --account-name {{ CLUSTER_NAME }}sa --account-key {{ account_key }} -c "files" -f "bootstrap.ign" -n "bootstrap.ign"
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.rc == 0
+  retries: 6
+  delay: 10
+
+          
+- name: 07 Create the private DNS zone
+  ansible.builtin.shell: |
+    az network private-dns zone create -g {{ RESOURCEGROUP }} -n {{ CLUSTER_NAME }}.{{ BASE_DOMAIN }}
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.rc == 0
+  retries: 6
+  delay: 10
+
+
+- name: 08 Prepare the ARM templates
+  ansible.builtin.template:
+    src: "{{ item + '.j2' }}"
+    dest: "{{ base_home + '/' + item + '.json' }}"
+    owner: root
+    group: root
+    mode: '0400'
+  loop:
+  - 01_vnet
+  - 02_storage
+  - 03_infra
+  - 04_bootstrap
+  - 05_masters
+  - 06_workers
+
+
+- name: 09 Creating a VNet in Azure
+  ansible.builtin.shell: |
+    az deployment group create -g {{ RESOURCEGROUP }} --template-file "01_vnet.json" --parameters baseName={{ infra_id }}
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.rc == 0
+  retries: 6
+  delay: 10
+
+- name: 09 Creating a VNet in Azure - Link the VNet template to the private DNS zone
+  ansible.builtin.shell: |
+    az network private-dns link vnet create -g {{ RESOURCEGROUP }} -z {{ CLUSTER_NAME }}.{{ BASE_DOMAIN }} -n {{ infra_id }}-network-link -v {{ infra_id }}-vnet -e false
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.rc == 0
+  retries: 6
+  delay: 10
+
+
+#- name: 10 Get VHD_BLOB_URL value
+#  ansible.builtin.shell: |
+#    export VHD_BLOB_URL=`az storage blob url --account-name {{ CLUSTER_NAME }}sa --account-key {{ account_key }} -c vhd -n "rhcos.vhd" -o tsv`
+#    echo -n $VHD_BLOB_URL >./VHD_BLOB_URL
+#  args:
+#    chdir: "{{ base_home }}"
+#
+#- name: set varaible vhd_blob_url
+#  set_fact:
+#    vhd_blob_url: "{{ lookup('file', base_home + '/VHD_BLOB_URL') }}"
+
+- name: 10 Deploying the RHCOS cluster image for the Azure infrastructure
+  ansible.builtin.shell: |
+    export VHD_BLOB_URL=`az storage blob url --account-name {{ CLUSTER_NAME }}sa --account-key {{ account_key }} -c vhd -n "rhcos.vhd" -o tsv`
+    echo az deployment group create -g {{ RESOURCEGROUP }} --template-file 02_storage.json --parameters vhdBlobURL=${VHD_BLOB_URL} --parameters baseName={{ infra_id }}
+    az deployment group create -g {{ RESOURCEGROUP }} --template-file 02_storage.json --parameters vhdBlobURL=${VHD_BLOB_URL} --parameters baseName={{ infra_id }}
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.rc == 0
+  retries: 6
+  delay: 10
+
+
+- debug: var=account_key
+
+    
+
+- name: 11 Creating networking and load balancing components in Azure
+  ansible.builtin.shell: |
+    echo az deployment group create -g {{ RESOURCEGROUP }} --template-file "03_infra.json" --parameters privateDNSZoneName={{ CLUSTER_NAME }}.{{ BASE_DOMAIN }} --parameters baseName={{ infra_id }}
+    az deployment group create -g {{ RESOURCEGROUP }} --template-file "03_infra.json" --parameters privateDNSZoneName={{ CLUSTER_NAME }}.{{ BASE_DOMAIN }} --parameters baseName={{ infra_id }}
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.rc == 0
+  retries: 3
+  delay: 10
+
+- name: 11 Creating networking and load balancing components in Azure - add DNS record
+  ansible.builtin.shell: |
+    export PUBLIC_IP=`az network public-ip list -g {{ RESOURCEGROUP }} --query "[?name=='{{ infra_id }}-master-pip'] | [0].ipAddress" -o tsv`
+    echo $PUBLIC_IP
+    az network dns record-set a add-record -g {{ RESOURCEGROUP }} -z {{ BASE_DOMAIN }} -n api.{{ CLUSTER_NAME }} -a ${PUBLIC_IP} --ttl 60
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.rc == 0
+  retries: 3
+  delay: 10
+
+
+- name: 12 Creating the bootstrap machine in Azure
+  ansible.builtin.shell: |
+    bootstrap_url_expiry=`date -u -d "24 hours" '+%Y-%m-%dT%H:%MZ'`
+    export BOOTSTRAP_URL=`az storage blob generate-sas -c 'files' -n 'bootstrap.ign' --https-only --full-uri --permissions r --expiry ${bootstrap_url_expiry} --account-name {{ CLUSTER_NAME }}sa --account-key {{ account_key }} -o tsv`
+    echo $BOOTSTRAP_URL
+    export BOOTSTRAP_IGNITION=`jq -rcnM --arg v "3.2.0" --arg url ${BOOTSTRAP_URL} '{ignition:{version:$v,config:{replace:{source:$url}}}}' | base64 | tr -d '\n'`
+    echo az deployment group create -g {{ RESOURCEGROUP }} --template-file "04_bootstrap.json" --parameters bootstrapIgnition=${BOOTSTRAP_IGNITION} --parameters baseName={{ infra_id }}
+    az deployment group create -g {{ RESOURCEGROUP }} --template-file "04_bootstrap.json" --parameters bootstrapIgnition=${BOOTSTRAP_IGNITION} --parameters baseName={{ infra_id }}
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.rc == 0
+  retries: 3
+  delay: 10
+
+
+- name: 13 Creating the control plane machines in Azure 
+  ansible.builtin.shell: |
+    export MASTER_IGNITION=`cat master.ign | base64 | tr -d '\n'`
+    az deployment group create -g {{ RESOURCEGROUP }} --template-file "05_masters.json" --parameters masterIgnition=${MASTER_IGNITION} --parameters baseName={{ infra_id }}
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.rc == 0
+  retries: 3
+  delay: 10
+
+
+- name: 13 Wait safe to remove the bootstrap resources 
+  ansible.builtin.shell: |
+    openshift-install wait-for bootstrap-complete --dir {{ base_home }} --log-level debug
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: "'safe to remove the bootstrap resources' in result.stderr"
+  retries: 6
+  delay: 30
+
+
+- name: 13 Delete the bootstrap resources - login azure
+  ansible.builtin.shell: |
+    az login --service-principal -u {{ CLIENT_ID }} -p {{ PASSWORD }} --tenant {{ TENANT}}
+  register: result
+  until: result.rc == 0
+  retries: 3
+  delay: 10
+
+- name: 13 Delete the bootstrap resources - bootstrap_ssh_in
+  ansible.builtin.shell: |
+    az network nsg rule delete -g {{ RESOURCEGROUP }} --nsg-name {{ infra_id }}-nsg --name bootstrap_ssh_in
+  register: result
+  until: result.rc == 0
+  retries: 3
+  delay: 10
+
+- name: 13 Delete the bootstrap resources - stop {{ infra_id }}-bootstrap
+  ansible.builtin.shell: |
+    az vm stop -g {{ RESOURCEGROUP }} --name {{ infra_id }}-bootstrap
+  register: result
+  until: result.rc == 0
+  retries: 3
+  delay: 10
+
+- name: 13 Delete the bootstrap resources - deallocate {{ infra_id }}-bootstrap
+  ansible.builtin.shell: |
+    az vm deallocate -g {{ RESOURCEGROUP }} --name {{ infra_id }}-bootstrap
+  register: result
+  until: result.rc == 0
+  retries: 3
+  delay: 10
+
+- name: 13 Delete the bootstrap resources
+  ansible.builtin.shell: |
+    az vm delete -g {{ RESOURCEGROUP }} --name {{ infra_id }}-bootstrap --yes
+  register: result
+  until: result.rc == 0
+  retries: 3
+  delay: 10
+
+- name: 13 Delete the bootstrap resources
+  ansible.builtin.shell: |
+    az disk delete -g {{ RESOURCEGROUP }} --name {{ infra_id }}-bootstrap_OSDisk --no-wait --yes
+  register: result
+  until: result.rc == 0
+  retries: 3
+  delay: 10
+
+- name: 13 Delete the bootstrap resources
+  ansible.builtin.shell: |
+    az network nic delete -g {{ RESOURCEGROUP }} --name {{ infra_id }}-bootstrap-nic --no-wait
+  register: result
+  until: result.rc == 0
+  retries: 3
+  delay: 10
+
+- name: 13 Delete the bootstrap resources
+  ansible.builtin.shell: |
+    az storage blob delete --account-key {{ account_key }} --account-name {{ CLUSTER_NAME }}sa --container-name files --name bootstrap.ign
+  register: result
+  until: result.rc == 0
+  retries: 3
+  delay: 10
+
+- name: 13 Delete the bootstrap resources - {{ infra_id }}-bootstrap-ssh-pip
+  ansible.builtin.shell: |
+    az network public-ip delete -g {{ RESOURCEGROUP }} --name {{ infra_id }}-bootstrap-ssh-pip
+  register: result
+  until: result.rc == 0
+  retries: 3
+  delay: 10
+
+- name: 14 Creating additional worker machines in Azure
+  ansible.builtin.shell: |
+    export WORKER_IGNITION=`cat worker.ign | base64 | tr -d '\n'`
+    az deployment group create -g {{ RESOURCEGROUP }} --template-file "06_workers.json" --parameters workerIgnition=${WORKER_IGNITION} --parameters baseName={{ infra_id }}
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.rc == 0
+  retries: 3
+  delay: 10
+
+
+- name: 15 Approving the certificate signing requests for your machines
+  ansible.builtin.shell: |
+    set -o pipefail
+    export KUBECONFIG={{ base_home }}/auth/kubeconfig
+    sleep 60
+    oc get csr | grep Pending | awk '{ print $1 }' | xargs --no-run-if-empty oc adm certificate approve
+  args:
+    chdir: "{{ base_home }}"
+  failed_when: false
+  loop:
+  - 1
+  - 2
+  - 3
+
+
+- name: 16 Adding the Ingress DNS records
+  ansible.builtin.shell: |
+    set -o pipefail
+    export KUBECONFIG={{ base_home }}/auth/kubeconfig
+    export PUBLIC_IP_ROUTER=`oc -n openshift-ingress get service router-default --no-headers | awk '{print $4}'`
+    echo $PUBLIC_IP_ROUTER
+    az network dns record-set a add-record -g {{ RESOURCEGROUP }} -z {{ BASE_DOMAIN }} -n *.apps.{{ CLUSTER_NAME }} -a ${PUBLIC_IP_ROUTER} --ttl 300
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: result.rc == 0
+  retries: 3
+  delay: 10
+
+- name: 17 Fix image registry storage issue
+  ansible.builtin.shell: |
+    set -o pipefail
+    export KUBECONFIG={{ base_home }}/auth/kubeconfig
+    oc set data secret/installer-cloud-credentials azure_resourcegroup={{ RESOURCEGROUP }} -n openshift-image-registry
+  register: result
+  until: result.rc == 0
+  retries: 3
+  delay: 10
+
+- name: Wait installation to complete
+  ansible.builtin.shell: |
+    openshift-install wait-for install-complete --dir {{ base_home }} 
+  args:
+    chdir: "{{ base_home }}"
+  register: result
+  until: "'Install complete' in result.stderr"
+  retries: 6
+  delay: 30
+
+- name: save credential
+  copy:
+    content: "{{ result.stderr }}"
+    dest: "{{ base_home }}/credential"
+

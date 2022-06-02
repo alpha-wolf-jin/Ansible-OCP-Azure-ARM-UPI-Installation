@@ -1,0 +1,7 @@
+---
+# defaults file for aro-instal
+
+base_home: /root/aro
+CLUSTER_NAME: aro
+AZURE_REGION: eastus
+BASE_DOMAIN: example.opentlc.com
